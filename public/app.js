@@ -1,298 +1,371 @@
-const state = { menu: [], tables: [], cart: new Map(), token: localStorage.getItem('restaurantOwnerToken') || '', stripeEnabled: false };
-const $ = (selector) => document.querySelector(selector);
-const money = (value) => `$${Number(value).toFixed(2)}`;
-const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const queryTable = new URLSearchParams(location.search).get('table');
-let selectedQrTable = queryTable && /^\d+$/.test(queryTable) ? Number(queryTable) : null;
+require('dotenv').config();
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const Database = require('better-sqlite3');
+const QRCode = require('qrcode');
+const Stripe = require('stripe');
 
-async function api(url, options = {}) {
-  const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}), ...options.headers };
-  const response = await fetch(url, { ...options, headers });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || 'Something went wrong.');
-  return result;
+const app = express();
+const port = Number(process.env.PORT || 3000);
+const baseUrl = (process.env.BASE_URL || `http://localhost:${port}`).replace(/\/$/, '');
+const ownerPassword = process.env.OWNER_PASSWORD || '';
+const tokenSecret = process.env.TOKEN_SECRET || '';
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+if (ownerPassword.length < 12 || tokenSecret.length < 32) {
+  console.error('Set OWNER_PASSWORD (12+ characters) and TOKEN_SECRET (32+ characters) in your environment.');
+  process.exit(1);
 }
-function showMessage(message, isError = false) {
-  const box = $('#orderMessage');
-  box.textContent = message;
-  box.classList.remove('hidden', 'error-notice');
-  if (isError) box.classList.add('error-notice');
-  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
-}
-function safeImage(name) {
-  const urls = [
-    'https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&w=900&q=80',
-    'https://images.unsplash.com/photo-1473093295043-cdd812d0e601?auto=format&fit=crop&w=900&q=80',
-    'https://images.unsplash.com/photo-1559737558-2f5a35f4523b?auto=format&fit=crop&w=900&q=80'
+
+const SESSION_COOKIE_NAME = 'restaurant_owner_session';
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const dataDir = path.join(__dirname, 'data');
+fs.mkdirSync(dataDir, { recursive: true });
+
+app.set('trust proxy', 1);
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please slow down.' }
+  })
+);
+app.use(cookieParser());
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+  })
+);
+
+const db = new Database(path.join(dataDir, 'restaurant.sqlite'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS menu_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
+    available INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS tables (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seats INTEGER NOT NULL CHECK(seats > 0),
+    status TEXT NOT NULL DEFAULT 'Available' CHECK(status IN ('Available','Occupied','Reserved')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    order_type TEXT NOT NULL CHECK(order_type IN ('pickup','dine-in')),
+    table_id INTEGER REFERENCES tables(id),
+    payment_method TEXT NOT NULL CHECK(payment_method IN ('in_person','stripe')),
+    payment_status TEXT NOT NULL DEFAULT 'unpaid',
+    status TEXT NOT NULL DEFAULT 'received',
+    total_cents INTEGER NOT NULL,
+    stripe_session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    menu_item_id INTEGER,
+    name TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price_cents INTEGER NOT NULL
+  );
+`);
+
+const menuCount = db.prepare('SELECT COUNT(*) AS count FROM menu_items').get().count;
+if (!menuCount) {
+  const insert = db.prepare('INSERT INTO menu_items (name,category,description,price_cents) VALUES (?,?,?,?)');
+  const seeds = [
+    ['Lemon Herb Salmon', "Chef's Picks", 'Grilled salmon with saffron rice, lemon butter, and seasonal greens.', 2600],
+    ['Truffle Mushroom Pasta', 'Pasta', 'Creamy parmesan pasta with roasted mushrooms and truffle aroma.', 2200],
+    ['Crispy Calamari', 'Starters', 'Golden-fried calamari with chili-lime aioli and citrus salt.', 1400],
+    ['Garden Burrata Bowl', 'Salads', 'Organic greens, burrata, tomatoes, basil, and balsamic glaze.', 1600],
+    ['Sunset Chicken Wrap', 'Mains', 'Grilled chicken, peppers, spinach, and herb dressing in a soft wrap.', 1800],
+    ['Molten Lava Cake', 'Desserts', 'Warm dark chocolate cake with vanilla cream and berry compote.', 1100]
   ];
-  return urls[Math.abs([...name].reduce((sum, char) => sum + char.charCodeAt(0), 0)) % urls.length];
+  const seed = db.transaction(() => seeds.forEach((item) => insert.run(...item)));
+  seed();
 }
-function renderMenu() {
-  const grid = $('#menuGrid');
-  grid.replaceChildren();
-  if (!state.menu.length) { grid.innerHTML = '<p class="muted">No menu items are currently available.</p>'; return; }
-  for (const item of state.menu) {
-    const card = document.createElement('article');
-    card.className = 'menu-card';
-    card.innerHTML = `<img class="dish-image" src="${safeImage(item.name)}" alt="${escapeHtml(item.name)}" loading="lazy"><div class="menu-content"><div class="menu-title"><h3>${escapeHtml(item.name)}</h3><span class="menu-price">${money(item.price)}</span></div><p class="menu-category">${escapeHtml(item.category)}</p><p class="menu-description">${escapeHtml(item.description)}</p><button class="button primary add-cart" data-add="${item.id}">Add to order</button></div>`;
-    grid.append(card);
-  }
+if (!db.prepare('SELECT COUNT(*) AS count FROM tables').get().count) {
+  const insertTable = db.prepare('INSERT INTO tables (seats,status) VALUES (?,?)');
+  [[2, 'Available'], [4, 'Reserved'], [2, 'Available'], [6, 'Occupied'], [4, 'Available']]
+    .forEach((item) => insertTable.run(...item));
 }
-function updateCart() {
-  const host = $('#cartItems');
-  host.replaceChildren();
-  if (!state.cart.size) host.innerHTML = '<p class="muted">Your cart is empty. Add something delicious from the menu.</p>';
-  for (const [id, quantity] of state.cart) {
-    const item = state.menu.find((entry) => entry.id === id);
-    if (!item) continue;
-    const row = document.createElement('div');
-    row.className = 'cart-line';
-    row.innerHTML = `<div><strong>${escapeHtml(item.name)}</strong><br><span class="muted">${money(item.price)} each</span></div><div class="quantity-control"><button type="button" data-change="${id}" data-by="-1" aria-label="Remove one">−</button><span>${quantity}</span><button type="button" data-change="${id}" data-by="1" aria-label="Add one">+</button><button type="button" class="remove-item" data-remove="${id}">Remove</button></div><strong>${money(item.price * quantity)}</strong>`;
-    host.append(row);
-  }
-  const total = [...state.cart].reduce((sum, [id, quantity]) => sum + (state.menu.find((item) => item.id === id)?.price || 0) * quantity, 0);
-  $('#cartTotal').textContent = money(total);
+
+function signToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', tokenSecret).update(body).digest('base64url');
+  return `${body}.${signature}`;
 }
-function renderTables() {
-  const host = $('#publicTables');
-  host.replaceChildren();
-  for (const table of state.tables) {
-    const card = document.createElement('article');
-    card.className = 'table-card';
-    card.innerHTML = `<div class="table-head"><h3>Table ${table.id}</h3><span class="status ${table.status}">${escapeHtml(table.status)}</span></div><p class="muted">Seats ${table.seats}</p>`;
-    host.append(card);
-  }
-  const select = $('#tableSelect');
-  select.innerHTML = '<option value="">Choose your table</option>';
-  state.tables.forEach((table) => {
-    const option = document.createElement('option');
-    option.value = table.id;
-    option.textContent = `Table ${table.id} · ${table.seats} seats`;
-    select.append(option);
-  });
-  if (selectedQrTable && state.tables.some((table) => table.id === selectedQrTable)) {
-    $('#orderType').value = 'dine-in';
-    select.value = String(selectedQrTable);
-    $('#tableNotice').textContent = `Welcome! Your QR code is for Table ${selectedQrTable}.`;
-    $('#tableNotice').classList.remove('hidden');
-  }
-  updateTableField();
+function verifyToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const [body, signature] = token.split('.');
+  if (!body || !signature) return false;
+  const expected = crypto.createHmac('sha256', tokenSecret).update(body).digest();
+  let received;
+  try { received = Buffer.from(signature, 'base64url'); } catch { return false; }
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    return payload.exp > Date.now();
+  } catch { return false; }
 }
-function updateTableField() {
-  const dineIn = $('#orderType').value === 'dine-in';
-  $('#tableField').classList.toggle('hidden', !dineIn);
-  $('#tableSelect').required = dineIn;
-  if (dineIn && selectedQrTable) $('#tableSelect').value = String(selectedQrTable);
-}
-async function loadOwnerData() {
-  const [orders, tables] = await Promise.all([api('/api/owner/orders'), api('/api/tables')]);
-  state.tables = tables;
-  renderTables();
-  renderOrders(orders);
-  await renderAdminMenu();
-  await renderAdminTables();
-}
-function renderOrders(orders) {
-  const host = $('#ordersList');
-  host.replaceChildren();
-  if (!orders.length) { host.innerHTML = '<p class="muted">No orders yet. New customer orders will appear here.</p>'; return; }
-  const statuses = ['received', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled'];
-  for (const order of orders) {
-    const card = document.createElement('article');
-    card.className = 'order-card';
-    const lineItems = order.items.map((item) => `${item.quantity} × ${escapeHtml(item.name)} (${money(item.unit_price)})`).join(' · ');
-    card.innerHTML = `<div class="order-card-head"><h4>Order #${order.id} · ${escapeHtml(order.customer_name)}</h4><strong>${money(order.total)}</strong></div><p>${escapeHtml(order.order_type)}${order.table_id ? ` · Table ${order.table_id}` : ''} · ${escapeHtml(order.phone)} · ${escapeHtml(order.created_at)}</p><p>${lineItems}</p><p>Payment: ${escapeHtml(order.payment_status)}${order.payment_method === 'in_person' ? ' · Pay at restaurant' : ' · Card'}</p><div class="order-controls"><label for="order-status-${order.id}">Status</label><select id="order-status-${order.id}" data-order-status="${order.id}">${statuses.map((status) => `<option ${status === order.status ? 'selected' : ''}>${status}</option>`).join('')}</select></div>`;
-    host.append(card);
-  }
-}
-async function renderAdminMenu() {
-  const allMenu = await api('/api/owner/menu');
-  const host = $('#adminMenu');
-  host.replaceChildren();
-  allMenu.forEach((item) => {
-    const row = document.createElement('div');
-    row.className = 'admin-row';
-    row.innerHTML = `<p><strong>${escapeHtml(item.name)}</strong> · ${money(item.price)} · ${item.available ? 'Available' : 'Hidden'}</p><button class="button secondary" data-availability="${item.id}" data-next="${!item.available}">${item.available ? 'Hide item' : 'Show item'}</button>`;
-    host.append(row);
+function setOwnerSession(res, token) {
+  res.cookie(SESSION_COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: SESSION_TTL_MS,
+    path: '/'
   });
 }
-async function renderAdminTables() {
-  const host = $('#adminTables');
-  host.replaceChildren();
-  for (const table of state.tables) {
-    const row = document.createElement('div');
-    row.className = 'admin-row';
-    row.innerHTML = `<div><strong>Table ${table.id}</strong><p class="muted">${table.seats} seats · ${escapeHtml(table.status)}</p><div class="qr-print hidden" id="qr-${table.id}"></div></div><div class="table-actions"><select data-table-status="${table.id}" aria-label="Table ${table.id} status"><option ${table.status === 'Available' ? 'selected' : ''}>Available</option><option ${table.status === 'Occupied' ? 'selected' : ''}>Occupied</option><option ${table.status === 'Reserved' ? 'selected' : ''}>Reserved</option></select><button class="button secondary" data-qr="${table.id}">Show QR</button></div>`;
-    host.append(row);
+function clearOwnerSession(res) {
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    path: '/'
+  });
+}
+function getOwnerToken(req) {
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.startsWith('Bearer ')) return authHeader.slice(7);
+  return req.cookies?.[SESSION_COOKIE_NAME] || '';
+}
+function requireOwner(req, res, next) {
+  const token = getOwnerToken(req);
+  if (!token || !verifyToken(token)) {
+    return res.status(401).json({ error: 'Owner login required.' });
   }
+  next();
 }
-async function refreshDashboard() {
-  try { await loadOwnerData(); } catch (error) { showMessage(error.message, true); }
+function centsToItem(row) {
+  return { id: row.id, name: row.name, category: row.category, description: row.description, price: row.price_cents / 100, available: Boolean(row.available) };
+}
+function validText(value, maxLength) {
+  return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= maxLength;
 }
 
-$('#menuGrid').addEventListener('click', (event) => {
-  const button = event.target.closest('[data-add]');
-  if (!button) return;
-  const id = Number(button.dataset.add);
-  state.cart.set(id, Math.min(20, (state.cart.get(id) || 0) + 1));
-  updateCart();
-  $('#order').scrollIntoView({ behavior: 'smooth', block: 'start' });
-});
-$('#cartItems').addEventListener('click', (event) => {
-  const change = event.target.closest('[data-change]');
-  const remove = event.target.closest('[data-remove]');
-  if (remove) state.cart.delete(Number(remove.dataset.remove));
-  if (change) {
-    const id = Number(change.dataset.change);
-    const next = (state.cart.get(id) || 0) + Number(change.dataset.by);
-    if (next < 1) state.cart.delete(id); else state.cart.set(id, Math.min(20, next));
-  }
-  updateCart();
-});
-$('#orderType').addEventListener('change', updateTableField);
-$('#checkoutForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if (!state.cart.size) return showMessage('Add at least one item before placing your order.', true);
-  const form = new FormData(event.currentTarget);
-  const payload = {
-    customerName: form.get('customerName'), phone: form.get('phone'), orderType: form.get('orderType'),
-    tableId: form.get('orderType') === 'dine-in' ? Number(form.get('tableId')) : null,
-    paymentMethod: form.get('paymentMethod'), items: [...state.cart].map(([id, quantity]) => ({ id, quantity }))
-  };
-  const button = $('#placeOrder');
-  button.disabled = true;
-  button.textContent = 'Sending order…';
-  $('#orderMessage').classList.add('hidden');
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.sendStatus(503);
+  let event;
   try {
-    const result = await api('/api/orders', { method: 'POST', body: JSON.stringify(payload) });
-    if (result.checkoutUrl) { location.assign(result.checkoutUrl); return; }
-    state.cart.clear();
-    updateCart();
-    event.currentTarget.reset();
-    updateTableField();
-    showMessage(`Thanks! Your order #${result.orderId} has been received. ${result.message}`);
-  } catch (error) { showMessage(error.message, true); }
-  finally { button.disabled = false; button.textContent = 'Place order'; }
-});
-
-$('#portalOpen').addEventListener('click', () => $('#ownerModal').classList.remove('hidden'));
-$('#portalClose').addEventListener('click', () => $('#ownerModal').classList.add('hidden'));
-$('#ownerModal').addEventListener('click', (event) => { if (event.target.id === 'ownerModal') $('#ownerModal').classList.add('hidden'); });
-$('#loginForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  $('#loginError').textContent = '';
-  try {
-    const result = await api('/api/owner/login', { method: 'POST', body: JSON.stringify({ password: $('#ownerPassword').value }) });
-    state.token = result.token;
-    localStorage.setItem('restaurantOwnerToken', state.token);
-    $('#loginForm').classList.add('hidden');
-    $('#dashboard').classList.remove('hidden');
-    await refreshDashboard();
-  } catch (error) { $('#loginError').textContent = error.message; }
-});
-$('#logout').addEventListener('click', () => {
-  state.token = '';
-  localStorage.removeItem('restaurantOwnerToken');
-  $('#dashboard').classList.add('hidden');
-  $('#loginForm').classList.remove('hidden');
-  $('#ownerPassword').value = '';
-});
-$('#menuForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  try {
-    await api('/api/owner/menu', { method: 'POST', body: JSON.stringify({ name: form.get('name'), category: form.get('category'), description: form.get('description'), price: Number(form.get('price')) }) });
-    event.currentTarget.reset();
-    await initMenu();
-    await renderAdminMenu();
-  } catch (error) { alert(error.message); }
-});
-$('#tableForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  try {
-    await api('/api/owner/tables', { method: 'POST', body: JSON.stringify({ seats: Number(form.get('seats')) }) });
-    event.currentTarget.reset();
-    await loadOwnerData();
-  } catch (error) { alert(error.message); }
-});
-$('#adminMenu').addEventListener('click', async (event) => {
-  const button = event.target.closest('[data-availability]');
-  if (!button) return;
-  try {
-    await api(`/api/owner/menu/${button.dataset.availability}`, { method: 'PATCH', body: JSON.stringify({ available: button.dataset.next === 'true' }) });
-    await initMenu();
-    await renderAdminMenu();
-  } catch (error) { alert(error.message); }
-});
-$('#adminTables').addEventListener('change', async (event) => {
-  const select = event.target.closest('[data-table-status]');
-  if (!select) return;
-  try {
-    await api(`/api/owner/tables/${select.dataset.tableStatus}`, { method: 'PATCH', body: JSON.stringify({ status: select.value }) });
-    await loadTables();
-  } catch (error) { alert(error.message); }
-});
-$('#adminTables').addEventListener('click', async (event) => {
-  const button = event.target.closest('[data-qr]');
-  if (!button) return;
-  const target = $(`#qr-${button.dataset.qr}`);
-  if (!target.classList.contains('hidden')) { target.classList.add('hidden'); button.textContent = 'Show QR'; return; }
-  try {
-    const qr = await api(`/api/owner/tables/${button.dataset.qr}/qr`);
-    target.innerHTML = `<img src="${qr.dataUrl}" alt="QR code for table ${button.dataset.qr}"><a href="${escapeHtml(qr.url)}" target="_blank" rel="noreferrer">${escapeHtml(qr.url)}</a><button type="button" class="button secondary" data-print="${button.dataset.qr}">Print QR</button>`;
-    target.classList.remove('hidden');
-    button.textContent = 'Hide QR';
-  } catch (error) { alert(error.message); }
-});
-$('#adminTables').addEventListener('click', (event) => {
-  const print = event.target.closest('[data-print]');
-  if (!print) return;
-  const image = $(`#qr-${print.dataset.print} img`).src;
-  const popup = window.open('', '_blank', 'width=500,height=600');
-  if (!popup) return alert('Please allow pop-ups to print table QR codes.');
-  popup.document.write(`<title>Table ${print.dataset.print} QR</title><body style="font:20px sans-serif;text-align:center;padding:30px"><h1>Table ${print.dataset.print}</h1><img style="width:320px" src="${image}" onload="window.print()"></body>`);
-  popup.document.close();
-});
-$('#ordersList').addEventListener('change', async (event) => {
-  const select = event.target.closest('[data-order-status]');
-  if (!select) return;
-  try {
-    await api(`/api/owner/orders/${select.dataset.orderStatus}`, { method: 'PATCH', body: JSON.stringify({ status: select.value }) });
-    await refreshDashboard();
-  } catch (error) { alert(error.message); }
-});
-
-async function initMenu() {
-  state.menu = await api('/api/menu');
-  renderMenu();
-  updateCart();
-}
-async function loadTables() {
-  state.tables = await api('/api/tables');
-  renderTables();
-}
-async function init() {
-  try {
-    const config = await api('/api/config');
-    $('#brandName').textContent = config.restaurant.name;
-    $('#footerName').textContent = config.restaurant.name;
-    $('#restaurantAddress').textContent = config.restaurant.address;
-    $('#restaurantPhone').textContent = config.restaurant.phone;
-    $('#footerContact').textContent = `${config.restaurant.address} · ${config.restaurant.phone}`;
-    state.stripeEnabled = config.stripeEnabled;
-    if (state.stripeEnabled) $('#paymentMethod').insertAdjacentHTML('beforeend', '<option value="stripe">Pay securely by card</option>');
-    await Promise.all([initMenu(), loadTables()]);
-    const paymentStatus = new URLSearchParams(location.search).get('payment');
-    if (paymentStatus === 'success') showMessage('Payment submitted. The restaurant will confirm the order when Stripe verifies payment.');
-    if (paymentStatus === 'cancelled') showMessage('Card payment was cancelled. Your order was not paid; you can place it again and pay at the restaurant.', true);
-    if (state.token) {
-      $('#loginForm').classList.add('hidden');
-      $('#dashboard').classList.remove('hidden');
-      await refreshDashboard();
-    }
+    event = stripe.webhooks.constructEvent(req.body, req.get('stripe-signature'), process.env.STRIPE_WEBHOOK_SECRET);
   } catch (error) {
-    $('#menuGrid').innerHTML = `<p class="muted">Could not connect to the ordering server: ${escapeHtml(error.message)}. Please refresh the page.</p>`;
+    return res.status(400).send(`Webhook signature verification failed: ${error.message}`);
   }
-}
-init();
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    if (session.payment_status === 'paid') {
+      db.prepare("UPDATE orders SET payment_status='paid', status='confirmed' WHERE id=? AND stripe_session_id=?")
+        .run(Number(session.metadata.order_id), session.id);
+    }
+  } else if (event.type === 'checkout.session.expired') {
+    const session = event.data.object;
+    db.prepare("UPDATE orders SET payment_status='failed', status='cancelled' WHERE stripe_session_id=? AND payment_status='pending'")
+      .run(session.id);
+  }
+  res.json({ received: true });
+});
+
+app.use(express.json({ limit: '100kb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/config', (_req, res) => {
+  res.json({
+    restaurant: {
+      name: process.env.RESTAURANT_NAME || 'Harbor & Hearth',
+      phone: process.env.RESTAURANT_PHONE || '(555) 010-2024',
+      address: process.env.RESTAURANT_ADDRESS || '18 Bayview Avenue, Newport, CA 92660'
+    },
+    stripeEnabled: Boolean(stripe)
+  });
+});
+app.get('/api/menu', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM menu_items WHERE available=1 ORDER BY id').all();
+  res.json(rows.map(centsToItem));
+});
+app.get('/api/tables', (_req, res) => {
+  res.json(db.prepare('SELECT id,seats,status FROM tables ORDER BY id').all());
+});
+
+const loginRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again later.' }
+});
+
+app.post('/api/owner/login', loginRateLimiter, (req, res) => {
+  const password = req.body?.password;
+  if (typeof password !== 'string') return res.status(400).json({ error: 'Enter the owner password.' });
+  const actual = Buffer.from(password);
+  const expected = Buffer.from(ownerPassword);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    return res.status(401).json({ error: 'Incorrect password.' });
+  }
+  const token = signToken({ role: 'owner', exp: Date.now() + SESSION_TTL_MS });
+  setOwnerSession(res, token);
+  res.json({ ok: true });
+});
+
+app.get('/api/owner/session', (req, res) => {
+  const token = getOwnerToken(req);
+  res.json({ authenticated: Boolean(token && verifyToken(token)) });
+});
+
+app.post('/api/owner/logout', requireOwner, (req, res) => {
+  clearOwnerSession(res);
+  res.json({ ok: true });
+});
+
+app.get('/api/owner/orders', requireOwner, (_req, res) => {
+  const rows = db.prepare(`
+    SELECT o.*, t.seats AS table_seats,
+      (SELECT json_group_array(json_object('name',oi.name,'quantity',oi.quantity,'unit_price',oi.unit_price_cents)) FROM order_items oi WHERE oi.order_id=o.id) AS items
+    FROM orders o LEFT JOIN tables t ON t.id=o.table_id ORDER BY o.id DESC LIMIT 200
+  `).all();
+  res.json(rows.map((row) => ({
+    ...row,
+    total: row.total_cents / 100,
+    items: JSON.parse(row.items || '[]').map((item) => ({ ...item, unit_price: item.unit_price / 100 }))
+  })));
+});
+app.patch('/api/owner/orders/:id', requireOwner, (req, res) => {
+  const allowed = ['received', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled'];
+  const status = req.body?.status;
+  if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid order status.' });
+  const result = db.prepare('UPDATE orders SET status=? WHERE id=?').run(status, Number(req.params.id));
+  if (!result.changes) return res.status(404).json({ error: 'Order not found.' });
+  res.json({ ok: true });
+});
+app.post('/api/owner/menu', requireOwner, (req, res) => {
+  const { name, category, description = '', price } = req.body || {};
+  if (!validText(name, 100) || !validText(category, 60) || typeof price !== 'number' || !Number.isFinite(price) || price < 0 || price > 10000 || typeof description !== 'string' || description.length > 500) {
+    return res.status(400).json({ error: 'Provide a valid dish name, category, description, and price.' });
+  }
+  const result = db.prepare('INSERT INTO menu_items (name,category,description,price_cents) VALUES (?,?,?,?)')
+    .run(name.trim(), category.trim(), description.trim(), Math.round(price * 100));
+  res.status(201).json(centsToItem(db.prepare('SELECT * FROM menu_items WHERE id=?').get(result.lastInsertRowid)));
+});
+app.patch('/api/owner/menu/:id', requireOwner, (req, res) => {
+  const available = req.body?.available;
+  if (typeof available !== 'boolean') return res.status(400).json({ error: 'Availability must be true or false.' });
+  const result = db.prepare('UPDATE menu_items SET available=? WHERE id=?').run(available ? 1 : 0, Number(req.params.id));
+  if (!result.changes) return res.status(404).json({ error: 'Menu item not found.' });
+  res.json({ ok: true });
+});
+app.post('/api/owner/tables', requireOwner, (req, res) => {
+  const seats = Number(req.body?.seats);
+  if (!Number.isInteger(seats) || seats < 1 || seats > 30) return res.status(400).json({ error: 'Seats must be between 1 and 30.' });
+  const result = db.prepare('INSERT INTO tables (seats,status) VALUES (?,\'Available\')').run(seats);
+  res.status(201).json({ id: Number(result.lastInsertRowid), seats, status: 'Available' });
+});
+app.patch('/api/owner/tables/:id', requireOwner, (req, res) => {
+  const allowed = ['Available', 'Occupied', 'Reserved'];
+  if (!allowed.includes(req.body?.status)) return res.status(400).json({ error: 'Invalid table status.' });
+  const result = db.prepare('UPDATE tables SET status=? WHERE id=?').run(req.body.status, Number(req.params.id));
+  if (!result.changes) return res.status(404).json({ error: 'Table not found.' });
+  res.json({ ok: true });
+});
+app.get('/api/owner/tables/:id/qr', requireOwner, async (req, res) => {
+  const table = db.prepare('SELECT id FROM tables WHERE id=?').get(Number(req.params.id));
+  if (!table) return res.status(404).json({ error: 'Table not found.' });
+  const url = `${baseUrl}/?table=${table.id}`;
+  res.json({ url, dataUrl: await QRCode.toDataURL(url, { width: 360, margin: 2 }) });
+});
+
+app.post('/api/orders', async (req, res) => {
+  try {
+    const { customerName, phone, orderType, tableId, items, paymentMethod = 'in_person' } = req.body || {};
+    if (!validText(customerName, 100) || !validText(phone, 40)) return res.status(400).json({ error: 'Name and phone are required.' });
+    if (!['pickup', 'dine-in'].includes(orderType)) return res.status(400).json({ error: 'Choose pickup or dine-in.' });
+    if (!['in_person', 'stripe'].includes(paymentMethod) || (paymentMethod === 'stripe' && !stripe)) return res.status(400).json({ error: 'Selected payment method is unavailable.' });
+    if (!Array.isArray(items) || items.length < 1 || items.length > 50) return res.status(400).json({ error: 'Add at least one menu item.' });
+    let selectedTable = null;
+    if (orderType === 'dine-in') {
+      selectedTable = Number(tableId);
+      if (!Number.isInteger(selectedTable) || !db.prepare('SELECT id FROM tables WHERE id=?').get(selectedTable)) {
+        return res.status(400).json({ error: 'Select a valid table.' });
+      }
+    }
+    const menuLookup = db.prepare('SELECT id,name,price_cents FROM menu_items WHERE id=? AND available=1');
+    const normalized = [];
+    let totalCents = 0;
+    for (const entry of items) {
+      const id = Number(entry?.id);
+      const quantity = Number(entry?.quantity);
+      if (!Number.isInteger(id) || !Number.isInteger(quantity) || quantity < 1 || quantity > 20) return res.status(400).json({ error: 'Invalid item or quantity.' });
+      const item = menuLookup.get(id);
+      if (!item) return res.status(400).json({ error: 'A selected menu item is no longer available.' });
+      normalized.push({ ...item, quantity });
+      totalCents += item.price_cents * quantity;
+    }
+    if (totalCents <= 0) return res.status(400).json({ error: 'Order total must be greater than zero.' });
+
+    const createOrder = db.transaction(() => {
+      const result = db.prepare(`INSERT INTO orders (customer_name,phone,order_type,table_id,payment_method,payment_status,status,total_cents)
+        VALUES (?,?,?,?,?,?,?,?)`).run(
+          customerName.trim(), phone.trim(), orderType, selectedTable,
+          paymentMethod, paymentMethod === 'stripe' ? 'pending' : 'unpaid', 'received', totalCents
+        );
+      const orderId = Number(result.lastInsertRowid);
+      const addItem = db.prepare('INSERT INTO order_items (order_id,menu_item_id,name,quantity,unit_price_cents) VALUES (?,?,?,?,?)');
+      normalized.forEach((item) => addItem.run(orderId, item.id, item.name, item.quantity, item.price_cents));
+      return orderId;
+    });
+    const orderId = createOrder();
+
+    if (paymentMethod === 'stripe') {
+      try {
+        const session = await stripe.checkout.sessions.create({
+          mode: 'payment',
+          line_items: normalized.map((item) => ({
+            quantity: item.quantity,
+            price_data: {
+              currency: 'usd',
+              unit_amount: item.price_cents,
+              product_data: { name: item.name }
+            }
+          })),
+          success_url: `${baseUrl}/?order=${orderId}&payment=success`,
+          cancel_url: `${baseUrl}/?order=${orderId}&payment=cancelled`,
+          metadata: { order_id: String(orderId) }
+        });
+        db.prepare('UPDATE orders SET stripe_session_id=? WHERE id=?').run(session.id, orderId);
+        return res.status(201).json({ orderId, checkoutUrl: session.url });
+      } catch (error) {
+        db.prepare("UPDATE orders SET payment_status='failed',status='cancelled' WHERE id=?").run(orderId);
+        console.error('Stripe checkout error:', error.message);
+        return res.status(502).json({ error: 'Could not start card payment. Please try pay at restaurant or try again.' });
+      }
+    }
+    res.status(201).json({ orderId, message: 'Order received. Pay at the restaurant.' });
+  } catch (error) {
+    console.error('Order error:', error);
+    res.status(500).json({ error: 'Could not place your order. Please try again.' });
+  }
+});
+
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api/')) return next();
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(port, () => console.log(`Restaurant website running at ${baseUrl}`));
