@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f8f3ee">
+  <title>Harbor & Hearth | Restaurant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="header"><div class="container nav">
+    <a class="brand" href="#home"><span class="brand-icon">H</span><span id="brandName">Harbor & Hearth</span></a>
+    <nav><a href="#about">About</a><a href="#menu">Menu</a><a href="#tables">Tables</a></nav>
+    <button id="portalOpen" class="button primary">Owner portal</button>
+  </div></header>
+  <main>
+    <section id="home" class="hero"><div class="container hero-inner">
+      <div><p class="eyebrow">Fresh · Seasonal · Cozy</p><h1>A good meal<br>brings us together.</h1><p class="hero-copy">Seasonal plates, coastal flavors, and warm hospitality. Pull up a chair and make yourself at home.</p><a class="button primary" href="#menu">Explore the menu</a></div>
+      <aside class="feature"><span class="badge">A favorite</span><h2>Made with care.<br>Remembered for flavor.</h2><p>Thoughtful ingredients and a little something special in every dish.</p><a href="#menu" class="text-link">Order from our menu →</a></aside>
+    </div></section>
+    <section id="about" class="section container"><div class="section-heading"><p class="eyebrow">Welcome in</p><h2>Good food, easy company.</h2></div><div class="about-grid">
+      <article class="info-card"><h3>Our restaurant</h3><p id="restaurantAddress">18 Bayview Avenue, Newport, CA 92660</p><p id="restaurantPhone">(555) 010-2024</p></article>
+      <article class="info-card"><h3>Hours</h3><p>Every day · 11:30 AM–10:30 PM</p><p>Pickup and dine-in orders welcome.</p></article>
+      <article class="info-card"><h3>Made for sharing</h3><p>Local ingredients, seasonal favorites, and a relaxed place to celebrate the everyday.</p></article>
+    </div></section>
+    <section id="menu" class="section menu-section"><div class="container"><div class="section-heading"><p class="eyebrow">From our kitchen</p><h2>The menu</h2><p>Choose your favorites and place an order online.</p></div><div id="menuGrid" class="menu-grid" aria-live="polite"></div></div></section>
+    <section id="order" class="section container order-section"><div class="section-heading"><p class="eyebrow">Online ordering</p><h2>Your order</h2><p id="tableNotice" class="notice hidden"></p></div><div class="order-layout">
+      <div class="cart-panel"><div id="cartItems"><p class="muted">Your cart is empty. Add something delicious from the menu.</p></div><div class="cart-total"><span>Total</span><strong id="cartTotal">$0.00</strong></div></div>
+      <form id="checkoutForm" class="checkout-panel"><h3>Order details</h3>
+        <label>Your name<input name="customerName" required maxlength="100" autocomplete="name"></label>
+        <label>Phone number<input name="phone" required maxlength="40" autocomplete="tel" type="tel"></label>
+        <label>Order type<select id="orderType" name="orderType"><option value="pickup">Pickup</option><option value="dine-in">Dine-in</option></select></label>
+        <label id="tableField" class="hidden">Table<select id="tableSelect" name="tableId"></select></label>
+        <label>Payment<select id="paymentMethod" name="paymentMethod"><option value="in_person">Pay at restaurant</option></select></label>
+        <button id="placeOrder" class="button primary full" type="submit">Place order</button>
+        <p class="fine-print">Your order is sent securely to the restaurant. Prices are confirmed by the server.</p>
+      </form>
+    </div><div id="orderMessage" class="notice hidden" role="status"></div></section>
+    <section id="tables" class="section tables-section"><div class="container"><div class="section-heading"><p class="eyebrow">At the restaurant</p><h2>Find your table</h2><p>Scan the QR code at your table to order for dine-in.</p></div><div id="publicTables" class="table-grid"></div></div></section>
+  </main>
+  <footer class="footer"><div class="container footer-inner"><div><strong id="footerName">Harbor & Hearth</strong><p>Good food. Warm welcome.</p></div><p id="footerContact"></p></div></footer>
+
+  <div id="ownerModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="portalTitle"><div class="modal-card"><button id="portalClose" class="close" aria-label="Close">×</button>
+    <div class="section-heading"><p class="eyebrow">Restaurant management</p><h2 id="portalTitle">Owner portal</h2></div>
+    <form id="loginForm" class="login-form"><label>Owner password<input id="ownerPassword" type="password" required autocomplete="current-password"></label><button class="button primary" type="submit">Sign in</button><p id="loginError" class="error"></p></form>
+    <div id="dashboard" class="dashboard hidden">
+      <div class="dashboard-top"><h3>Orders</h3><button id="logout" class="button secondary">Log out</button></div><div id="ordersList" class="orders-list"></div>
+      <div class="admin-grid">
+        <section class="admin-panel"><h3>Add menu item</h3><form id="menuForm"><label>Dish name<input name="name" required maxlength="100"></label><label>Category<input name="category" required maxlength="60"></label><label>Description<textarea name="description" maxlength="500" rows="2"></textarea></label><label>Price (USD)<input name="price" type="number" min="0.01" max="10000" step="0.01" required></label><button class="button primary">Add dish</button></form></section>
+        <section class="admin-panel"><h3>Tables & QR codes</h3><form id="tableForm" class="add-table"><label>Seats<input name="seats" type="number" min="1" max="30" required></label><button class="button primary">Add table</button></form><div id="adminTables" class="admin-tables"></div></section>
+      </div>
+      <section class="admin-panel"><h3>Menu availability</h3><div id="adminMenu" class="admin-menu"></div></section>
+    </div>
+  </div></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

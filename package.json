@@ -1,0 +1,22 @@
+{
+  "name": "restaurant-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Restaurant website with online ordering, owner management, and table QR codes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "qrcode": "^1.5.4",
+    "stripe": "^17.5.0"
+  }
+}
